@@ -2,6 +2,7 @@
 //! accept/discard of variant sessions: HTML/JSX wrapper carbonize, the
 //! Svelte component inline path, receipts, source locks, buffer scrub.
 
+use crate::inject::resolve_source_traits;
 use crate::paths::{live_dir, safe_session_id};
 use crate::pending_edits::{read_buffer, write_buffer};
 use crate::roots::enter_live_root;
@@ -657,9 +658,10 @@ fn handle_discard_unlocked(id: &str, lines: &[String], target_file: &str) -> Res
     let Some(block) = find_marker_block(id, lines) else {
         return Err("Markers not found".to_string());
     };
-    let original = extract_original(lines, &block);
     let is_jsx = is_jsx_file(target_file);
     let (rs, re) = expand_replace_range(&block, lines, is_jsx, id);
+    let original = original_or_refuse(id, lines, &block, rs, re)
+        .ok_or_else(|| format!("{} Source not modified; replace the wrapper with the original element by hand.", ORIGINAL_MISSING))?;
     let indent = leading_ws(&lines[rs]);
     let restored = deindent_content(&original, &indent);
     let mut new_lines: Vec<String> = Vec::new();
@@ -670,11 +672,33 @@ fn handle_discard_unlocked(id: &str, lines: &[String], target_file: &str) -> Res
     Ok(())
 }
 
+/// The opening `<style>` tag of a carbonize block in `target_file`: the file
+/// type's own `styleTag` with the session id filled in.
+///
+/// On `.astro` that tag carries `is:inline`, exactly like the variants block
+/// it replaces. A bare `<style>` there is a different thing: Astro compiles
+/// it into a `?astro&type=style&index=N` module, which renumbers the page's
+/// own style modules for as long as the block exists and removes one again
+/// when the cleanup deletes it. Astro's dev server answers the reload of
+/// that vanished index with a 500 (7.3.6 and later) or serves the wrong
+/// block's CSS under the surviving index (7.3.5 and earlier).
+fn carbonize_style_open(target_file: &str, id: &str) -> String {
+    resolve_source_traits(target_file)
+        .style_tag
+        .replace("SESSION_ID", id)
+}
+
 /// JS: buildCarbonizeReplacement({...})
+///
+/// `style_open` is the opening `<style>` tag for the carbonize block. It is
+/// the same tag the variants block was authored with for this file type
+/// (`carbonize_style_open`), so accept never changes how the framework's
+/// compiler treats the block.
 fn build_carbonize_replacement(
     indent: &str,
     cs: (&str, &str),
     is_jsx: bool,
+    style_open: &str,
     id: &str,
     variant_num: &str,
     css: Option<&[String]>,
@@ -699,9 +723,9 @@ fn build_carbonize_replacement(
             body_indent, co, id, cc
         ));
         lines.push(format!(
-            "{}<style data-impeccable-css=\"{}\">{}",
+            "{}{}{}",
             body_indent,
-            id,
+            style_open,
             if is_jsx { "{`" } else { "" }
         ));
         for css_line in css {
@@ -785,7 +809,10 @@ fn handle_accept_unlocked(
     let Some(variant_content) = extract_variant(lines, &block, variant_num) else {
         return Err(format!("Variant {} not found", variant_num));
     };
-    let original_content = extract_original(lines, &block);
+    // Accept writes the chosen variant, not the original; the original only
+    // tells the manual-edit buffer which edits the accept replaced. A wrapper
+    // without the slot therefore accepts normally (only discard needs it).
+    let original_content = extract_original(lines, &block).unwrap_or_default();
     let css_content = extract_css(lines, &block, id);
     let variant_text = variant_content.join("\n");
     let has_helper_attrs = variant_text.contains("data-impeccable-variant");
@@ -828,6 +855,7 @@ fn handle_accept_unlocked(
         &indent,
         cs,
         is_jsx,
+        &carbonize_style_open(target_file, id),
         id,
         variant_num,
         css_content.as_deref(),
@@ -1107,13 +1135,60 @@ fn trim_surrounding_blank_lines(lines: Vec<String>) -> Vec<String> {
     lines[start..end].to_vec()
 }
 
-/// JS: extractOriginal(lines, block)
-fn extract_original(lines: &[String], block: &MarkerBlock) -> Vec<String> {
+/// JS: extractOriginal(lines, block), with the missing slot kept apart from
+/// an empty one: `None` when the block has no `data-impeccable-variant="original"`
+/// element at all.
+fn extract_original(lines: &[String], block: &MarkerBlock) -> Option<Vec<String>> {
     let text = strip_style_and_join(lines, block);
-    match extract_inner_by_attr(&text, "data-impeccable-variant=\"original\"") {
-        None => Vec::new(),
-        Some(inner) => trim_surrounding_blank_lines(inner.split('\n').map(String::from).collect()),
+    extract_inner_by_attr(&text, "data-impeccable-variant=\"original\"")
+        .map(|inner| trim_surrounding_blank_lines(inner.split('\n').map(String::from).collect()))
+}
+
+const ORIGINAL_MISSING: &str = "Original not found: the variants wrapper has no data-impeccable-variant=\"original\" slot, so the element it replaced cannot be restored from it.";
+
+static INSERT_MODE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(&format!(r#"data-impeccable-mode{ws}*={ws}*(?:"insert"|'insert')"#, ws = WS)).unwrap()
+});
+
+/// The original slot's content for discard, or `None` (refuse, write nothing)
+/// when a wrapper that replaced an element has none (#875): restoring "nothing" there
+/// deletes the element while reporting success. An insert wrapper
+/// (`data-impeccable-mode="insert"`) replaced nothing and legitimately has no
+/// slot, so it restores to nothing.
+fn original_or_refuse(
+    id: &str,
+    lines: &[String],
+    block: &MarkerBlock,
+    rs: usize,
+    re: usize,
+) -> Option<Vec<String>> {
+    if let Some(original) = extract_original(lines, block) {
+        return Some(original);
     }
+    // Only this session's own wrapper tag counts, read whole even when a
+    // formatter split its attributes over several lines: a nested insert, or
+    // CSS that names the attribute, must not exempt a replace wrapper.
+    let end = re.min(lines.len().saturating_sub(1));
+    let text = lines[rs..=end].join("\n");
+    wrapper_open_tag(&text, id)
+        .is_some_and(|tag| INSERT_MODE_RE.is_match(tag))
+        .then(Vec::new)
+}
+
+/// The whole opening tag that carries `data-impeccable-variants="<id>"`,
+/// from its `<` to its `>`, across line breaks.
+fn wrapper_open_tag<'a>(text: &'a str, id: &str) -> Option<&'a str> {
+    let e = regex::escape(id);
+    let re = Regex::new(&format!(
+        r#"data-impeccable-variants{ws}*={ws}*(?:"{id}"|'{id}'|\{{["']{id}["']\}})"#,
+        ws = WS,
+        id = e
+    ))
+    .ok()?;
+    let m = re.find(text)?;
+    let start = text[..m.start()].rfind('<')?;
+    let end = m.end() + text[m.end()..].find('>')?;
+    Some(&text[start..=end])
 }
 
 /// JS: extractVariant(lines, block, variantNum)
@@ -1302,6 +1377,254 @@ mod discard_tests {
         assert_eq!(
             out,
             "      </div>\n      <Bar title=\"Log in\" />\n    </AuthPage>"
+        );
+    }
+}
+
+#[cfg(test)]
+mod original_slot_tests {
+    use super::*;
+
+    fn scratch(name: &str, src: &[&str]) -> (std::path::PathBuf, String, Vec<String>) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "impeccable-original-slot-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(name);
+        let lines: Vec<String> = src.iter().map(|s| s.to_string()).collect();
+        std::fs::write(&file, lines.join("\n")).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        (dir, path, lines)
+    }
+
+    // The hand-written fallback scaffold live.md used to show: no original slot.
+    const NO_ORIGINAL: &[&str] = &[
+        "<main>",
+        "  <!-- impeccable-variants-start ab12cd34 -->",
+        "  <div data-impeccable-variants=\"ab12cd34\" data-impeccable-variant-count=\"1\" style=\"display: contents\">",
+        "    <div data-impeccable-variant=\"1\">",
+        "      <h1 class=\"hero\">Bolder</h1>",
+        "    </div>",
+        "  </div>",
+        "  <!-- impeccable-variants-end ab12cd34 -->",
+        "</main>",
+    ];
+
+    #[test]
+    fn discard_without_an_original_slot_refuses_and_writes_nothing() {
+        let (dir, path, lines) = scratch("index.html", NO_ORIGINAL);
+        let err = handle_discard_unlocked("ab12cd34", &lines, &path).unwrap_err();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.starts_with("Original not found"), "{err}");
+        assert!(err.contains("Source not modified"), "{err}");
+        assert_eq!(out, NO_ORIGINAL.join("\n"), "the wrapper stays exactly as it was");
+    }
+
+    #[test]
+    fn accept_without_an_original_slot_still_accepts_the_variant() {
+        let (dir, path, lines) = scratch("index.html", NO_ORIGINAL);
+        let result = handle_accept_unlocked("ab12cd34", "1", &lines, &path, None, None);
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(out.contains("<h1 class=\"hero\">Bolder</h1>"), "{out}");
+        assert!(!out.contains("impeccable-variants-start"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_original_slot_still_restores_to_empty() {
+        let src = [
+            "<main>",
+            "  <!-- impeccable-variants-start ab12cd34 -->",
+            "  <div data-impeccable-variants=\"ab12cd34\" data-impeccable-variant-count=\"1\" style=\"display: contents\">",
+            "    <div data-impeccable-variant=\"original\"></div>",
+            "    <div data-impeccable-variant=\"1\"><p>New</p></div>",
+            "  </div>",
+            "  <!-- impeccable-variants-end ab12cd34 -->",
+            "</main>",
+        ];
+        let (dir, path, lines) = scratch("index.html", &src);
+        handle_discard_unlocked("ab12cd34", &lines, &path).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!out.contains("impeccable-variants"), "{out}");
+    }
+
+    #[test]
+    fn only_the_session_wrapper_tag_can_mark_an_insert() {
+        // A nested insert session and CSS naming the attribute both sit inside
+        // this replace wrapper; neither may exempt it from the refusal.
+        let src = [
+            "<main>",
+            "  <!-- impeccable-variants-start ab12cd34 -->",
+            "  <div data-impeccable-variants=\"ab12cd34\" data-impeccable-variant-count=\"1\" style=\"display: contents\">",
+            "    <style data-impeccable-css=\"ab12cd34\">[data-impeccable-mode=\"insert\"] { outline: 0; }</style>",
+            "    <div data-impeccable-variant=\"1\">",
+            "      <div data-impeccable-variants=\"ef56ab78\" data-impeccable-mode=\"insert\" data-impeccable-variant-count=\"1\"></div>",
+            "    </div>",
+            "  </div>",
+            "  <!-- impeccable-variants-end ab12cd34 -->",
+            "</main>",
+        ];
+        let (dir, path, lines) = scratch("index.html", &src);
+        let err = handle_discard_unlocked("ab12cd34", &lines, &path).unwrap_err();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.starts_with("Original not found"), "{err}");
+        assert_eq!(out, src.join("\n"));
+    }
+
+    #[test]
+    fn an_insert_wrapper_split_over_lines_still_discards() {
+        let src = [
+            "<main>",
+            "  <!-- impeccable-variants-start ab12cd34 -->",
+            "  <div",
+            "    data-impeccable-variants=\"ab12cd34\"",
+            "    data-impeccable-mode=\"insert\"",
+            "    data-impeccable-variant-count=\"1\"",
+            "    style=\"display: contents\"",
+            "  >",
+            "    <div data-impeccable-variant=\"1\"><p>New</p></div>",
+            "  </div>",
+            "  <!-- impeccable-variants-end ab12cd34 -->",
+            "</main>",
+        ];
+        let (dir, path, lines) = scratch("index.html", &src);
+        handle_discard_unlocked("ab12cd34", &lines, &path).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out, "<main>\n</main>");
+    }
+
+    #[test]
+    fn an_insert_wrapper_has_no_original_and_discards_to_nothing() {
+        let src = [
+            "<main>",
+            "  <!-- impeccable-variants-start ab12cd34 -->",
+            "  <div data-impeccable-variants=\"ab12cd34\" data-impeccable-mode=\"insert\" data-impeccable-variant-count=\"1\" style=\"display: contents\">",
+            "    <div data-impeccable-variant=\"1\"><p>New</p></div>",
+            "  </div>",
+            "  <!-- impeccable-variants-end ab12cd34 -->",
+            "</main>",
+        ];
+        let (dir, path, lines) = scratch("index.html", &src);
+        handle_discard_unlocked("ab12cd34", &lines, &path).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out, "<main>\n</main>");
+    }
+}
+
+#[cfg(test)]
+mod carbonize_tests {
+    use super::*;
+
+    fn wrapped(style_open: &str) -> Vec<String> {
+        [
+            "  <main>",
+            "    <!-- impeccable-variants-start ab12cd34 -->",
+            "    <div data-impeccable-variants=\"ab12cd34\" data-impeccable-variant-count=\"2\" style=\"display: contents\">",
+            "      <!-- Original -->",
+            "      <div data-impeccable-variant=\"original\">",
+            "        <h1 class=\"hero-title\">Title</h1>",
+            "      </div>",
+            "      <!-- Variants: insert below this line -->",
+            style_open,
+            "        [data-impeccable-variant=\"1\"] > h1 { font-weight: 300; }",
+            "        [data-impeccable-variant=\"2\"] > h1 { font-weight: 900; }",
+            "      </style>",
+            "      <div data-impeccable-variant=\"1\">",
+            "        <h1 class=\"hero-title\">Title</h1>",
+            "      </div>",
+            "      <div data-impeccable-variant=\"2\" style=\"display: none\">",
+            "        <h1 class=\"hero-title\">Title</h1>",
+            "      </div>",
+            "    </div>",
+            "    <!-- impeccable-variants-end ab12cd34 -->",
+            "  </main>",
+            "",
+            "<style>",
+            "  .hero-title { font-size: 2rem; }",
+            "</style>",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn carbonize(file_name: &str, style_open: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("impeccable-carbonize-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(file_name);
+        let lines = wrapped(style_open);
+        std::fs::write(&file, lines.join("\n")).unwrap();
+        let outcome = handle_accept_unlocked("ab12cd34", "2", &lines, &file.to_string_lossy(), None, None);
+        let out = std::fs::read_to_string(&file).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(outcome, Ok(AcceptOutcome::Carbonized { carbonize: true, .. })),
+            "accept did not carbonize: {out}"
+        );
+        out
+    }
+
+    /// Every `<style ...>` opening tag in `source`, in order.
+    fn style_tags(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("<style"))
+            .collect()
+    }
+
+    /// Astro compiles a bare `<style>` into a style module and numbers the
+    /// modules in source order. The variants block is `is:inline`, so the
+    /// carbonize block has to be too: otherwise accept puts a compiled block
+    /// in front of the page's own and the cleanup takes it away again, and
+    /// the dev server fails the reload of the index that vanished.
+    #[test]
+    fn an_astro_carbonize_block_keeps_the_style_tag_inline() {
+        let out = carbonize("index.astro", "      <style is:inline data-impeccable-css=\"ab12cd34\">");
+        assert_eq!(
+            style_tags(&out),
+            vec!["<style is:inline data-impeccable-css=\"ab12cd34\">", "<style>"],
+            "{out}"
+        );
+        assert!(out.contains("<!-- impeccable-carbonize-start ab12cd34 -->"), "{out}");
+    }
+
+    /// The tag comes from the file type, not from what the agent wrote: an
+    /// Astro variants block authored without `is:inline` still carbonizes
+    /// into the inline form.
+    #[test]
+    fn an_astro_carbonize_block_is_inline_whatever_the_variants_tag_was() {
+        let out = carbonize("index.astro", "      <style data-impeccable-css=\"ab12cd34\">");
+        assert_eq!(
+            style_tags(&out),
+            vec!["<style is:inline data-impeccable-css=\"ab12cd34\">", "<style>"],
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn an_html_carbonize_block_keeps_the_plain_style_tag() {
+        let out = carbonize("index.html", "      <style data-impeccable-css=\"ab12cd34\">");
+        assert_eq!(
+            style_tags(&out),
+            vec!["<style data-impeccable-css=\"ab12cd34\">", "<style>"],
+            "{out}"
         );
     }
 }

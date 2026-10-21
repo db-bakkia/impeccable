@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  LIVE_FILES, linkSvelte, lockPathFor, stageWrappedHtml, stageWrappedJsx, write, writeBuffer,
+  LIVE_FILES, linkSvelte, lockPathFor, stageWrappedAstro, stageWrappedHtml, stageWrappedJsx, write, writeBuffer,
 } from '../live-helpers.mjs';
 
 const F = LIVE_FILES;
@@ -45,6 +45,29 @@ export default [
       fs.writeFileSync(p, fs.readFileSync(p, 'utf8').replace(/ {8}<style data-impeccable-css="ab12cd34">[\s\S]*?<\/style>\n/, ''));
     },
   }),
+  // --- A hand-written wrapper without the original slot (#875): discard
+  // refuses and leaves the source untouched instead of deleting the element;
+  // accept needs no original and writes the variant. An insert wrapper has no slot by design and still discards. ---
+  ...['--discard', '--variant'].map(mode => A(`live-accept-html-no-original-${mode === '--discard' ? 'discard' : 'accept'}`, 'live-html',
+    ['--id', ID, ...(mode === '--discard' ? [mode] : [mode, '1'])], {
+      snap: ['index.html'],
+      setup: (ws) => {
+        stageWrappedHtml(ws);
+        const p = path.join(ws, 'index.html');
+        fs.writeFileSync(p, fs.readFileSync(p, 'utf8').replace(/ *<!-- Original -->\n *<div data-impeccable-variant="original">\n.*\n *<\/div>\n/, ''));
+      },
+    })),
+  {
+    id: 'live-accept-html-insert-discard', workspace: 'live-html', files: [...F, 'index.html'],
+    steps: [
+      { verb: 'live-insert', args: ['--id', ID, '--position', 'after', '--element-id', 'features'] },
+      { verb: 'live-accept', args: ['--id', ID, '--discard'] },
+    ],
+  },
+  // --- Astro: the carbonize style block keeps `is:inline`, so accept never
+  // adds a compiled style module that the cleanup then removes ---
+  A('live-accept-astro-variant-2-steps', 'live-astro', ['--id', ID, '--variant', '2', '--param-values', '{"face":"serif"}'], { snap: ['src/**'], setup: stageWrappedAstro }),
+  A('live-accept-astro-discard', 'live-astro', ['--id', ID, '--discard'], { snap: ['src/**'], setup: stageWrappedAstro }),
   A('live-accept-generated-file', 'live-html', ['--id', ID, '--variant', '1'], {
     snap: ['dist/**'],
     setup: (ws) => {
