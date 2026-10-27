@@ -161,13 +161,20 @@ pub fn check_element_borders_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
             status_context: is_status_context_element(dom, el),
             tab_context: is_tab_context_element(dom, el),
             corners,
+            // `parse_radius_corners` keeps the horizontal radii only, so an
+            // elliptical corner (`50% / 4px`) leaves the circle test unread.
+            box_size: (!radius_value.contains('/')).then_some([rect.width, rect.height]),
         },
     );
     // A side-tab is a card of text with a coloured edge; a card a visitor
     // cannot see (in a tab pane at opacity 0, a slide parked off its track)
     // shows no edge. Asked only once the border path has reported.
-    if hits.iter().any(|h| h.id == "side-tab") && crate::browser::painted::unpainted_text_box(dom, el).is_some() {
-        hits.retain(|h| h.id != "side-tab");
+    // The same holds for an accent band across a rounded card's top or
+    // bottom (revenpages.fr's mega-menu panel at opacity 0, visibility
+    // hidden, observations-1010 row 17).
+    let edge_rule = |h: &RuleHit| h.id == "side-tab" || h.id == "border-accent-on-rounded";
+    if hits.iter().any(edge_rule) && crate::browser::painted::unpainted_text_box(dom, el).is_some() {
+        hits.retain(|h| !edge_rule(h));
     }
     hits
 }
@@ -516,16 +523,53 @@ pub fn check_element_pseudo_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> 
 /// A table row or cell, by tag or ARIA role.
 const ROW_OR_CELL: &str = "tr, td, th, [role=\"row\"], [role=\"cell\"], [role=\"gridcell\"], [role=\"rowheader\"]";
 
+/// A side border on a table row or cell that reads as a stripe, off the
+/// computed sides: `(thickness, edge, alone)`, `alone` when no other side is
+/// drawn. A box drawn top and bottom too is a frame, and a box off a table
+/// part rounded away from the stripe is the card tell the borders check
+/// reports.
+fn row_border_stripe(dom: &dyn Dom, el: ElId, tag: &str) -> Option<(f64, &'static str, bool)> {
+    let mut sides = [(0.0, None); 4];
+    let mut drawn = [false; 4];
+    for (i, s) in SIDES.iter().enumerate() {
+        let width = style_px(dom, el, &format!("border{s}Width"));
+        let style = dom.style(el, &format!("border{s}Style"));
+        let colour = parse_rgb_or_any(&dom.style(el, &format!("border{s}Color")));
+        sides[i] = (width, colour);
+        drawn[i] = width > 0.0
+            && !matches!(style.as_str(), "" | "none" | "hidden")
+            && colour.is_some_and(|c| c.alpha_or_one() >= 0.1);
+    }
+    if drawn[0] && drawn[2] {
+        return None;
+    }
+    [(3, "left"), (1, "right")].into_iter().find_map(|(i, edge)| {
+        let (width, colour) = sides[i];
+        (drawn[i]
+            && (2.0..=6.0).contains(&width)
+            && colour.is_some_and(|c| crate::checks::row_stripe::is_row_stripe_accent(&c))
+            && (BORDER_SAFE_TAGS.contains(&tag)
+                || !is_rounded_away_from_side(
+                    parse_radius_corners(Some(&dom.style(el, "borderRadius")), dom.rect(el).width).as_ref(),
+                    i,
+                )))
+        .then(|| (width, edge, drawn.iter().filter(|&&d| d).count() == 1))
+    })
+}
+
 /// A side stripe painted with an inset box-shadow, read off the computed
 /// shadow: one inset layer, no blur or spread, offset along one axis only,
 /// in an accent colour. On a table row or cell it is a side tab whatever its
 /// corners (2-6px, left or right: the stylesheet scan's band for rows); on
 /// anything else it is the card tell on a card rounded away from it (3-12px,
-/// any edge), the gate every other stripe form passes. A selected or current
-/// row's stripe marks the selection and stays silent.
+/// any edge), the gate every other stripe form passes. A side border on a
+/// row or cell is read the same way, unless it is the borders check's card
+/// tell. A selected or current row's stripe marks the selection and stays
+/// silent.
 pub fn check_element_inset_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
     let shadow = dom.style(el, "boxShadow");
-    if shadow.is_empty() || shadow == "none" || !shadow.contains("inset") {
+    let inset = shadow.contains("inset");
+    if !inset && style_px(dom, el, "borderLeftWidth") == 0.0 && style_px(dom, el, "borderRightWidth") == 0.0 {
         return Vec::new();
     }
     // A row by class only (`.row-card`) that is rounded is a card, as the
@@ -536,6 +580,10 @@ pub fn check_element_inset_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
             .any(|c| crate::checks::row_stripe::is_row_or_cell_selector(&format!(".{c}")))
             && !parse_radius_corners(Some(&dom.style(el, "borderRadius")), dom.rect(el).width)
                 .is_some_and(|c| [c.top_left, c.top_right, c.bottom_right, c.bottom_left].iter().any(|r| *r > 0.0)));
+    // A side border off a row is the borders check's to read.
+    if !inset && !row {
+        return Vec::new();
+    }
     let tag = tag_lower(dom, el);
     if !row && (BORDER_SAFE_TAGS.contains(&tag.as_str()) || tag == "table" || tag == "summary") {
         return Vec::new();
@@ -602,7 +650,7 @@ pub fn check_element_inset_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
     if selected(el) || (row && hosts.iter().any(|&e| selected(e))) {
         return Vec::new();
     }
-    if row {
+    let detail = if row {
         // The row's state, or a cell that paints nothing but the stripe, as
         // the stylesheet scan asks: a shaded cell with an edge is a column.
         let status = |e: ElId| {
@@ -613,12 +661,36 @@ pub fn check_element_inset_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
                 })
         };
         let bare = parse_rgb_or_any(&dom.style(el, "backgroundColor"))
-            .map_or(true, |c| c.alpha_or_one() < 0.1);
-        if !status(el) && !hosts.iter().any(|&e| status(e)) && !bare {
-            return Vec::new();
-        }
+            .map_or(true, |c| c.alpha_or_one() < 0.1)
+            && matches!(dom.style(el, "backgroundImage").as_str(), "" | "none");
+        let flagged = status(el) || hosts.iter().any(|&e| status(e));
+        (inset && (flagged || bare))
+            .then(|| inset_stripe_detail(dom, el, &shadow, true, rect.width))
+            .flatten()
+            .or_else(|| {
+                let (thickness, edge, _) = row_border_stripe(dom, el, &tag)
+                    .filter(|&(_, _, alone)| flagged || (bare && alone))?;
+                Some(format!(
+                    "{} — border-{edge} {}px stripe on a row or cell ({edge} edge)",
+                    class_selector(dom, el),
+                    number_to_string(thickness)
+                ))
+            })
+    } else {
+        inset_stripe_detail(dom, el, &shadow, false, rect.width)
+    };
+    let Some(detail) = detail else { return Vec::new() };
+    if crate::browser::painted::unpainted_text_box(dom, el).is_some() {
+        return Vec::new();
     }
-    for layer in measures::parse_shadow_layers(&shadow) {
+    vec![RuleHit::new("side-tab", detail)]
+}
+
+/// The inset shadow layer that is a stripe, as a finding's detail: on a row
+/// 2-6px down the left or right in a row accent, elsewhere 3-12px along any
+/// edge of a box rounded away from it.
+fn inset_stripe_detail(dom: &dyn Dom, el: ElId, shadow: &str, row: bool, width: f64) -> Option<String> {
+    for layer in measures::parse_shadow_layers(shadow) {
         if !layer.inset || layer.blur != 0.0 || layer.spread != 0.0 {
             continue;
         }
@@ -637,35 +709,30 @@ pub fn check_element_inset_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
             (false, true) => (ay, "bottom", 2),
             _ => continue,
         };
-        let detail = if row {
+        if row {
             if side % 2 == 0 || !(2.0..=6.0).contains(&thickness) {
                 continue;
             }
-            format!(
+            return Some(format!(
                 "{} — inset box-shadow {}px stripe on a row or cell ({edge} edge)",
                 class_selector(dom, el),
                 number_to_string(thickness)
-            )
-        } else {
-            if !(3.0..=12.0).contains(&thickness) {
-                continue;
-            }
-            let corners = parse_radius_corners(Some(&dom.style(el, "borderRadius")), rect.width);
-            if !is_rounded_away_from_side(corners.as_ref(), side) {
-                continue;
-            }
-            format!(
-                "{} — inset box-shadow {}px stripe ({edge})",
-                class_selector(dom, el),
-                number_to_string(thickness)
-            )
-        };
-        if crate::browser::painted::unpainted_text_box(dom, el).is_some() {
-            return Vec::new();
+            ));
         }
-        return vec![RuleHit::new("side-tab", detail)];
+        if !(3.0..=12.0).contains(&thickness) {
+            continue;
+        }
+        let corners = parse_radius_corners(Some(&dom.style(el, "borderRadius")), width);
+        if !is_rounded_away_from_side(corners.as_ref(), side) {
+            continue;
+        }
+        return Some(format!(
+            "{} — inset box-shadow {}px stripe ({edge})",
+            class_selector(dom, el),
+            number_to_string(thickness)
+        ));
     }
-    Vec::new()
+    None
 }
 
 const STRIPE_CHILD_SKIP: &str = "nav, blockquote, pre, table, button, a, select, progress, meter, [role=\"progressbar\"], [role=\"slider\"], [role=\"scrollbar\"], [role=\"separator\"], [role=\"tablist\"]";
@@ -3659,6 +3726,9 @@ pub fn check_element_glow_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
 /// A stop painting under this much alpha is a tint over whatever sits behind
 /// it, not a palette decision (Tailwind's `/5` and `/10` fills, 0.13 washes).
 const AI_PALETTE_MIN_STOP_ALPHA: f64 = 0.15;
+/// A gradient of one colour whose every stop keeps this much alpha or more
+/// is that colour laid flat, not a fade.
+const AI_PALETTE_SAME_COLOUR_FADE_MIN_ALPHA: f64 = 0.75;
 /// Past this blur radius a gradient is atmosphere: no edge and no hue
 /// survives it as something a visitor reads as a color choice.
 const AI_PALETTE_MAX_BLUR_PX: f64 = 24.0;
@@ -3854,6 +3924,15 @@ fn ai_palette_gradient_hit(
             && c.b == first.b
             && c.alpha_or_one() == first.alpha_or_one()
     }) {
+        return None;
+    }
+    // One colour fading only a little (articulation-hub.vercel.app's
+    // `rgb(29, 74, 84)` to the same at 0.8, observations-1010 row 14) still
+    // reads as that flat colour over what lies behind; the ramp a glow blob
+    // draws runs down toward transparent.
+    if stops.iter().all(|c| c.r == first.r && c.g == first.g && c.b == first.b)
+        && stops.iter().all(|c| c.alpha_or_one() >= AI_PALETTE_SAME_COLOUR_FADE_MIN_ALPHA)
+    {
         return None;
     }
     let rect = element_rect(dom, el)?;
@@ -6685,6 +6764,89 @@ mod tests {
     }
 
     #[test]
+    fn side_border_on_a_status_cell_is_a_side_tab() {
+        let (mut d, body) = page();
+        let table = d.add(Some(body), "table");
+        let tr = d.add(Some(table), "tr");
+        let td = d.add(Some(tr), "td");
+        for (el, w) in [(table, 600.0), (tr, 600.0), (td, 200.0)] {
+            visible(&mut d, el);
+            d.set_rect(el, 0.0, 0.0, w, 48.0);
+        }
+        d.set_attr(tr, "data-state", "failed");
+        let stripe = [
+            ("boxShadow", "none"),
+            ("borderRadius", "0px"),
+            ("borderTopWidth", "0px"),
+            ("borderRightWidth", "0px"),
+            ("borderBottomWidth", "0px"),
+            ("borderLeftWidth", "3px"),
+            ("borderTopStyle", "none"),
+            ("borderRightStyle", "none"),
+            ("borderBottomStyle", "none"),
+            ("borderLeftStyle", "solid"),
+            ("borderLeftColor", "rgb(194, 65, 12)"),
+        ];
+        d.set_styles(td, &stripe);
+        let hits = check_element_inset_stripe_dom(&d, td);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].snippet, "td — border-left 3px stripe on a row or cell (left edge)");
+        let red = "rgb(194, 65, 12)";
+        for (props, why) in [
+            (&[("borderLeftStyle", "none")][..], "no border drawn"),
+            (&[("borderLeftColor", "rgb(156, 163, 175)")], "neutral colour"),
+            (
+                &[
+                    ("borderTopWidth", "1px"),
+                    ("borderTopStyle", "solid"),
+                    ("borderTopColor", red),
+                    ("borderBottomWidth", "1px"),
+                    ("borderBottomStyle", "solid"),
+                    ("borderBottomColor", red),
+                ],
+                "a frame",
+            ),
+        ] {
+            d.set_styles(td, props);
+            assert!(check_element_inset_stripe_dom(&d, td).is_empty(), "{why}");
+            d.set_styles(td, &stripe);
+        }
+        d.set_styles(
+            td,
+            &[("borderLeftWidth", "0px"), ("borderRightWidth", "3px"), ("borderRightStyle", "solid"), ("borderRightColor", red)],
+        );
+        assert_eq!(check_element_inset_stripe_dom(&d, td)[0].snippet, "td — border-right 3px stripe on a row or cell (right edge)");
+        d.set_styles(td, &stripe);
+        // A rounded ARIA row's side border is the borders check's card tell.
+        let grid_row = d.add(Some(body), "div");
+        visible(&mut d, grid_row);
+        d.set_rect(grid_row, 0.0, 0.0, 600.0, 48.0);
+        d.set_attr(grid_row, "role", "row");
+        d.add_selector(grid_row, "[role=\"row\"]");
+        d.set_attr(grid_row, "class", "has-error");
+        d.set_styles(grid_row, &stripe);
+        assert_eq!(check_element_inset_stripe_dom(&d, grid_row).len(), 1);
+        d.set_style(grid_row, "borderRadius", "12px");
+        assert!(check_element_inset_stripe_dom(&d, grid_row).is_empty(), "rounded ARIA row");
+        // A plain cell is a stripe only while it paints nothing else.
+        let plain_row = d.add(Some(table), "tr");
+        let plain = d.add(Some(plain_row), "td");
+        for el in [plain_row, plain] {
+            visible(&mut d, el);
+            d.set_rect(el, 0.0, 0.0, 200.0, 48.0);
+        }
+        d.set_styles(plain, &stripe);
+        assert_eq!(check_element_inset_stripe_dom(&d, plain).len(), 1);
+        d.set_styles(plain, &[("borderRightWidth", "1px"), ("borderRightStyle", "solid"), ("borderRightColor", red)]);
+        assert!(check_element_inset_stripe_dom(&d, plain).is_empty(), "another side drawn on a plain cell");
+        d.set_styles(plain, &stripe);
+        d.set_style(plain, "backgroundImage", "linear-gradient(rgb(248, 250, 252), rgb(226, 232, 240))");
+        assert!(check_element_inset_stripe_dom(&d, plain).is_empty(), "a plain cell shaded with a gradient");
+        d.set_attr(tr, "aria-selected", "true");
+        assert!(check_element_inset_stripe_dom(&d, td).is_empty(), "selected row");
+    }
+
+    #[test]
     fn pseudo_stripe_flags_left_stripe_and_skips_neutral() {
         let (mut d, body) = page();
         let card = d.add(Some(body), "div");
@@ -8914,6 +9076,68 @@ mod tests {
         assert!(check_element_borders_dom(&d, card).is_empty());
     }
 
+    /// observations-1010 row 17 (revenpages.fr 10139645): an accent band
+    /// across the top of a rounded mega-menu panel parked at opacity 0 and
+    /// `visibility: hidden` shows no band. The open panel reports.
+    #[test]
+    fn border_accent_on_rounded_skips_a_panel_nobody_sees() {
+        let (mut d, body) = page();
+        let menu = d.add(Some(body), "div");
+        d.set_rect(menu, 0.0, 0.0, 900.0, 400.0);
+        let panel = d.add(Some(menu), "div");
+        d.set_rect(panel, 0.0, 0.0, 280.0, 320.0);
+        d.add_text(panel, "Our services and how we work");
+        d.set_styles(
+            panel,
+            &[
+                ("borderTopWidth", "3px"),
+                ("borderTopColor", "rgb(235, 87, 71)"),
+                ("borderRightWidth", "0px"),
+                ("borderBottomWidth", "0px"),
+                ("borderLeftWidth", "0px"),
+                ("borderRadius", "4px"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+            ],
+        );
+        let hits = check_element_borders_dom(&d, panel);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].id, "border-accent-on-rounded");
+        d.set_styles(menu, &[("opacity", "0"), ("visibility", "hidden")]);
+        assert!(check_element_borders_dom(&d, panel).is_empty());
+    }
+
+    /// observations-1010 row 6 (mypip.dev 10137997): the browser form reads
+    /// the circle off the element's own box.
+    #[test]
+    fn a_border_arc_on_a_ring_is_not_a_side_tab() {
+        let (mut d, body) = page();
+        let ring = d.add(Some(body), "div");
+        d.set_rect(ring, 100.0, 100.0, 64.0, 64.0);
+        d.set_styles(
+            ring,
+            &[
+                ("borderTopWidth", "0px"),
+                ("borderRightWidth", "2px"),
+                ("borderRightColor", "rgb(45, 212, 191)"),
+                ("borderBottomWidth", "0px"),
+                ("borderLeftWidth", "0px"),
+                ("borderRadius", "9999px"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+            ],
+        );
+        assert!(check_element_borders_dom(&d, ring).is_empty());
+        // Corners flattened to 4px vertically are not a circle.
+        d.set_style(ring, "borderRadius", "50% / 4px");
+        assert_eq!(check_element_borders_dom(&d, ring).len(), 1);
+        d.set_style(ring, "borderRadius", "9999px");
+        // The same border on a wide rounded card is a side tab.
+        d.set_rect(ring, 100.0, 100.0, 320.0, 64.0);
+        d.set_style(ring, "borderRadius", "12px");
+        let hits = check_element_borders_dom(&d, ring);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].id, "side-tab");
+    }
+
     /// Bootstrap's floating labels and `placeholder:text-transparent` hide the
     /// placeholder so a label can take its place.
     #[test]
@@ -9216,6 +9440,28 @@ mod tests {
         let hits = palette_hits(&d, overlay);
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].snippet, "Purple/violet gradient background");
+    }
+
+    /// observations-1010 row 14 (articulation-hub.vercel.app 10136044): one
+    /// colour fading only to 0.8 (0.75 or more) is that colour laid flat. The same colour
+    /// fading toward transparent is a glow blob and reports.
+    #[test]
+    fn ai_palette_gradient_skips_a_colour_that_barely_fades() {
+        let (mut d, body) = page();
+        let flat = gradient_surface(&mut d, body, "linear-gradient(135deg, rgb(29, 74, 84), rgba(29, 74, 84, 0.8))");
+        assert!(palette_hits(&d, flat).is_empty());
+        let blob = gradient_surface(&mut d, body, "radial-gradient(50% 50%, rgb(20, 184, 166) 0%, rgba(20, 184, 166, 0) 100%)");
+        assert_eq!(palette_hits(&d, blob)[0].snippet, "Cyan gradient background");
+        let half = gradient_surface(&mut d, body, "linear-gradient(90deg, rgb(20, 184, 166), rgba(20, 184, 166, 0.4))");
+        assert_eq!(palette_hits(&d, half)[0].snippet, "Cyan gradient background");
+        // Review of round 14: teal to the same at 0.5 or 0.6, and the
+        // stock violet to lavender, are visible two-tone ramps.
+        for end in ["0.5", "0.6"] {
+            let ramp = gradient_surface(&mut d, body, &format!("linear-gradient(90deg, rgb(20, 184, 166), rgba(20, 184, 166, {end}))"));
+            assert_eq!(palette_hits(&d, ramp)[0].snippet, "Cyan gradient background", "{end}");
+        }
+        let violet = gradient_surface(&mut d, body, "linear-gradient(135deg, rgb(124, 58, 237), rgba(124, 58, 237, 0.5))");
+        assert_eq!(palette_hits(&d, violet)[0].snippet, "Purple/violet gradient background");
     }
 
     /// observations-1004 row 24 (librairielorguaise.fr 10046523): a 7px
