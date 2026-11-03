@@ -1013,6 +1013,17 @@ pub fn check_element_stripe_child(el: &StaticElement<'_>, style: &StyleValues) -
     check_stripe_child(&class_selector(el), width, edge, bg)
 }
 
+/// An opaque handle for `el`, as the colour-pair dedupe names the element
+/// that claims a pair and the copies it speaks for. A claim with this
+/// handle is always on screen: this engine has no layout, so it behaves as
+/// an unnamed claim did.
+pub fn element_handle(el: &StaticElement<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    el.id().hash(&mut h);
+    h.finish()
+}
+
 /// JS: checks.mjs#checkElementColors(el, style, tag, window, customPropMap, hasAnchorInheritRule)
 pub fn check_element_colors(
     el: &StaticElement<'_>,
@@ -1200,7 +1211,7 @@ pub fn check_element_colors(
     let mut findings = check_colors_deduped_shaped(
         &color_opts,
         seen,
-        None,
+        Some(impeccable_core::checks::rules::PairClaim { owner: element_handle(el), on_screen: true }),
         &is_decorative,
         &mut |h: &RuleHit| !scoped_ignore_active(el, &h.id) && !picture_under_text(el),
     );
@@ -1521,10 +1532,13 @@ pub fn check_element_glow(
 
 /// JS: detect-html.mjs#checkElementBrokenImage(el)
 pub fn check_element_broken_image(el: &StaticElement<'_>) -> Vec<RuleHit> {
-    // `srcset` is a source too (HTML Standard: an img needs `src` or `srcset`).
-    if el.get_attribute("srcset").is_some_and(|set| {
-        let set = js::trim(set);
-        !set.is_empty() && set != "#"
+    // A usable source is `src`, `srcset` (HTML Standard: an img needs either)
+    // or a binding of one (`:src`, `[ngSrc]`, `data-src`).
+    if el.attributes().any(|(name, value)| {
+        let value = js::trim(value);
+        impeccable_detect::regex_matchers::names_image_source(name)
+            && !value.is_empty()
+            && value != "#"
     }) {
         return Vec::new();
     }
@@ -1534,14 +1548,10 @@ pub fn check_element_broken_image(el: &StaticElement<'_>) -> Vec<RuleHit> {
             "<img> with no src attribute".to_string(),
         )];
     };
-    let trimmed = js::trim(src);
-    if trimmed.is_empty() || trimmed == "#" {
-        return vec![RuleHit::new(
-            "broken-image",
-            format!("<img src=\"{}\">", src),
-        )];
-    }
-    Vec::new()
+    vec![RuleHit::new(
+        "broken-image",
+        format!("<img src=\"{}\">", src),
+    )]
 }
 
 /// JS: checks.mjs#checkElementOversizedH1(el, style, tag, window)
